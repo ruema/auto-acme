@@ -12,14 +12,79 @@ import requests
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
+from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
 from cryptography.x509.oid import NameOID
-from jwcrypto import jwk, jws
-from jwcrypto.common import json_encode
 
 logger = logging.getLogger(__name__)
 
 ACME_IDENTIFIER = x509.ObjectIdentifier("1.3.6.1.5.5.7.1.31")
 SSL3_RT_HANDSHAKE = 22
+
+
+def base64url_encode(payload):
+    if not isinstance(payload, bytes):
+        payload = payload.encode("utf-8")
+    encode = base64.urlsafe_b64encode(payload)
+    return encode.decode("utf-8").rstrip("=")
+
+
+def encode_int(n):
+    return base64url_encode(n.to_bytes(32, "big"))
+
+
+def json_encode(header):
+    return json.dumps(
+        header,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def jwk_dict(private_key):
+    numbers = private_key.public_key().public_numbers()
+    return {
+        "kty": "EC",
+        "crv": "P-256",
+        "x": encode_int(numbers.x),
+        "y": encode_int(numbers.y),
+    }
+
+
+def jwk_thumbprint(key):
+    payload = json_encode(jwk_dict(key))
+    digest = hashlib.sha256(payload).digest()
+    return base64url_encode(digest)
+
+
+def generate_signed_request(private_key, kid, url, nonce, payload):
+    protected = {
+        "alg": "ES256",
+        "nonce": nonce,
+        "url": url,
+    }
+    if kid is None:
+        protected["jwk"] = jwk_dict(private_key)
+    else:
+        protected["kid"] = kid
+    encoded_protected = base64url_encode(json_encode(protected))
+    if payload is None:
+        encoded_payload = ""
+    else:
+        encoded_payload = base64url_encode(json_encode(payload))
+    signature = private_key.sign(
+        f"{encoded_protected}.{encoded_payload}".encode("utf8"),
+        ec.ECDSA(hashes.SHA256()),
+    )
+    r, s = decode_dss_signature(signature)
+    return json_encode(
+        {
+            "protected": encoded_protected,
+            "payload": encoded_payload,
+            "signature": base64url_encode(
+                r.to_bytes(32, "big") + s.to_bytes(32, "big")
+            ),
+        }
+    )
 
 
 def generate_alpn_certificate(hostname, challenge_token, key):
@@ -38,7 +103,7 @@ def generate_alpn_certificate(hostname, challenge_token, key):
         The bytes of private_key_pem and certificate_pem.
     """
     logger.info("Generating ALPN certificate for %s", hostname)
-    thumbprint = key.thumbprint()
+    thumbprint = jwk_thumbprint(key)
     challenge = f"{challenge_token}.{thumbprint}".encode()
     digest = b"\x04\x20" + hashlib.sha256(challenge).digest()
     ext = x509.UnrecognizedExtension(ACME_IDENTIFIER, value=digest)
@@ -139,9 +204,9 @@ def generate_csr(
     return private_key_pem, csr_der
 
 
-def generate_jwkey():
+def generate_acme_key():
     """Generate a new JWK key pair for ACME account."""
-    return jws.JWK.generate(kty="EC")
+    return ec.generate_private_key(ec.SECP256R1())
 
 
 class AcmeClient:
@@ -155,6 +220,7 @@ class AcmeClient:
         """
         self.acme_directory_url = acme_directory_url
         self.private_key = private_key
+        self.account_id = None
         self._acme_directory = None
         self._nonce = None
 
@@ -198,23 +264,11 @@ class AcmeClient:
             response = requests.get(new_nonce_url)
         return response.headers["Replay-Nonce"]
 
-    def _create_request(self, url, payload):
-        header = {
-            "alg": "ES256" if self.private_key["kty"] == "EC" else "RS256",
-            "nonce": self.nonce,
-            "url": url,
-        }
-        if url == self.acme_directory["newAccount"]:
-            header["jwk"] = self.private_key.export_public(as_dict=True)
-        else:
-            header["kid"] = self.private_key["kid"]
-        msg = "" if payload is None else json_encode(payload)
-        signed_jws = jws.JWS(msg)
-        signed_jws.add_signature(self.private_key, None, json_encode(header))
-        return signed_jws.serialize(compact=False)
-
     def _post_request(self, url, payload):
-        signed_request = self._create_request(url, payload)
+        signed_request = generate_signed_request(
+            self.private_key, self.account_id, url, self.nonce, payload
+        )
+
         # Send the request
         response = requests.post(
             url,
@@ -254,8 +308,9 @@ class AcmeClient:
         }
         if contact:
             payload["contact"] = contact
+        self.account_id = None
         response = self._post_request(new_account_url, payload)
-        self.private_key["kid"] = response.headers["Location"]
+        self.account_id = response.headers["Location"]
         return response.json()
 
     def create_order(
@@ -277,11 +332,33 @@ class AcmeClient:
             "identifiers": identifiers,
         }
         response = self._post_request(new_order_url, payload)
-        return response.json()
+        return response.json(), response.headers["Location"]
+
+    def wait_for_valid(self, url, pending_statuses=["pending"]):
+        start_time = time.monotonic()
+        while time.monotonic() - start_time < 600:
+            response = self.post_request(url)
+            if response["status"] not in pending_statuses:
+                return response
+            time.sleep(1)
+        raise RuntimeError("timeout")
 
 
 class AcmeContext:
-    def __init__(self, certificate_path, acme_url, hostname, contact=None, agree_tos=False):
+    def __init__(
+        self, certificate_path, acme_url, hostname, contact=None, agree_tos=False
+    ):
+        """
+        Initializes the AcmeContext for managing automatic certificate renewal.
+
+        Args:
+            certificate_path: The directory path where certificates and keys will be stored.
+            acme_url: The URL of the ACME directory.
+            hostname: The domain name for which the certificate is managed.
+            contact: A list of contact strings (e.g., email addresses) for the ACME account.
+            agree_tos: A boolean indicating whether to agree to the ACME Terms of Service.
+
+        """
         self.acme_url = acme_url
         self.hostname = hostname
         self.contact = contact
@@ -316,23 +393,27 @@ class AcmeContext:
             return
         cert = x509.load_pem_x509_certificate(data)
         duration = cert.not_valid_after_utc - cert.not_valid_before_utc
-        self.renewal_date = cert.not_valid_before_utc + duration*(2/3)
+        self.renewal_date = cert.not_valid_before_utc + duration * (2 / 3)
         ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ssl_context.load_cert_chain(certificate_path)
         self.ssl_context = ssl_context
         if self.socket is not None:
             self.socket._context = self.ssl_context
 
-    def load_jwk(self):
+    def load_acme_key(self):
         try:
-            data = self._account_key_path.read_text()
-            data = json.loads(data)
-            return jwk.JWK(**data)
+            data = self._account_key_path.read_bytes()
+            return serialization.load_pem_private_key(data, None)
         except FileNotFoundError:
-            return generate_jwkey()
+            return generate_acme_key()
 
-    def save_jwk(self, jwk_key):
-        self._account_key_path.write_text(jwk_key.export_private())
+    def save_acme_key(self, acme_key):
+        private_pem = acme_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        self._account_key_path.write_bytes(private_pem)
 
     def wrap_socket(
         self,
@@ -369,42 +450,50 @@ class AcmeContext:
 
     def renew_certificate(self):
         self.certificate_path.mkdir(parents=True, exist_ok=True)
-        jwk_key = self.load_jwk()
-        acme_client = AcmeClient(self.acme_url, jwk_key)
+        acme_key = self.load_acme_key()
+        acme_client = AcmeClient(self.acme_url, acme_key)
         account = acme_client.create_account(self.contact, self.agree_tos)
         if account["status"] != "valid":
             raise RuntimeError()
-        self.save_jwk(jwk_key)
+        self.save_acme_key(acme_key)
 
-        order = acme_client.create_order(
+        order, order_url = acme_client.create_order(
             [{"type": "dns", "value": self.hostname}]
         )
-        auth = acme_client.post_request(order["authorizations"][0])
-        challenge = next(
-            challenge
-            for challenge in auth["challenges"]
-            if challenge["type"] == "tls-alpn-01"
+        for auth_url in order["authorizations"]:
+            auth = acme_client.post_request(auth_url)
+            # skip if already valid
+            if auth["status"] == "valid":
+                logger.info("Already verified.")
+                continue
+            challenge = next(
+                challenge
+                for challenge in auth["challenges"]
+                if challenge["type"] == "tls-alpn-01"
+            )
+            hostname = auth["identifier"]["value"]
+            token = challenge["token"]
+            url = challenge["url"]
+
+            alpn_certificate = generate_alpn_certificate(hostname, token, acme_key)
+            self._alpn_path.write_bytes(alpn_certificate)
+            self.acme_context.load_cert_chain(self._alpn_path)
+            self.socket._context = self.alpn_context
+            _response = acme_client.post_request(url, {})
+            response = acme_client.wait_for_valid(auth_url)
+            if response["status"] != "valid":
+                raise RuntimeError()
+            self._alpn_path.unlink()
+
+        private_key_pem, csr_der = generate_csr(self.hostname)
+        csr = base64.urlsafe_b64encode(csr_der).strip(b"=")
+        finalize = acme_client.post_request(order["finalize"], {"csr": csr.decode()})
+        response = acme_client.wait_for_valid(
+            order_url, pending_statuses=["pending", "processing"]
         )
-        hostname = auth["identifier"]["value"]
-        token = challenge["token"]
-        url = challenge["url"]
-
-        alpn_certificate = generate_alpn_certificate(hostname, token, jwk_key)
-        self._alpn_path.write_bytes(alpn_certificate)
-        self.acme_context.load_cert_chain(self._alpn_path)
-        self.socket._context = self.alpn_context
-
-        response = acme_client.post_request(url, {})
-        while response["status"] == "pending":
-            time.sleep(1)
-            response = acme_client.post_request(url)
         if response["status"] != "valid":
             raise RuntimeError()
-        private_key_pem, csr_der = generate_csr(hostname)
-        csr = base64.urlsafe_b64encode(csr_der).strip(b"=")
-        finalize = acme_client.post_request(
-            order["finalize"], {"csr": csr.decode()}
-        )
+
         resp = requests.get(finalize["certificate"])
         resp.raise_for_status()
         self._certificate_path.write_bytes(private_key_pem + resp.content)

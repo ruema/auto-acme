@@ -46,8 +46,9 @@ if __name__ == '__main__':
         certificate_path="~/.acme_certs",
         acme_url="https://acme-v02.api.letsencrypt.org/directory",
         hostname="example.com",
+        agree_tos=True,
     )
-    app.run(host="0.0.0.0", port=8443, ssl_context=acme_context)
+    app.run(host="0.0.0.0", port=443, ssl_context=acme_context)
 ```
 
 With Django
@@ -61,8 +62,9 @@ def run_django_with_acme():
         certificate_path="~/.acme_certs",
         acme_url="https://acme-v02.api.letsencrypt.org/directory",
         hostname="example.com",
+        agree_tos=True,
     )
-    server = WSGIServer(("0.0.0.0", 8443), WSGIHandler(), ssl_context=acme_context)
+    server = WSGIServer(("0.0.0.0", 443), WSGIHandler(), ssl_context=acme_context)
     server.serve_forever()
 
 if __name__ == "__main__":
